@@ -2,14 +2,17 @@ from flask import Flask, jsonify, request
 from datetime import datetime, timezone
 import json
 import os
+import uuid
+import hashlib
+import hmac
 import base64
 import copy
-import gzip
 
 app = Flask(__name__)
 
 USERS_FILE = 'users.json'
 GAME_DATA_FILE = 'game_data.json'
+SESSIONS_FILE = 'sessions.json'
 
 BOOSTER_IDS = ('Rotate', 'SwapShape', 'Hint')
 BOOSTER_AMOUNT = 99
@@ -39,23 +42,42 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def load_users():
-    return load_json(USERS_FILE, {})
+def load_users():   return load_json(USERS_FILE, {})
+def save_users(u):  save_json(USERS_FILE, u)
+
+def load_game_data(): return load_json(GAME_DATA_FILE, {})
+def save_game_data(d): save_json(GAME_DATA_FILE, d)
+
+def load_sessions(): return load_json(SESSIONS_FILE, {})
+def save_sessions(s): save_json(SESSIONS_FILE, s)
 
 
-def save_users(users):
-    save_json(USERS_FILE, users)
+def generate_support_code():
+    return ''.join(uuid.uuid4().hex.upper()[:6])
 
 
-def load_game_data():
-    return load_json(GAME_DATA_FILE, {})
+def generate_user_id():
+    return uuid.uuid4().hex[:24]
 
 
-def save_game_data(data):
-    save_json(GAME_DATA_FILE, data)
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+
+def make_jwt(payload: dict, secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = b64url(json.dumps(header, separators=(',', ':')).encode())
+    payload_b64 = b64url(json.dumps(payload, separators=(',', ':')).encode())
+    signing_input = f"{header_b64}.{payload_b64}".encode()
+    signature = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+    return f"{header_b64}.{payload_b64}.{b64url(signature)}"
+
+
+JWT_SECRET = 'change-me-in-production'
 
 
 def force_boosters(data: dict) -> dict:
+    """Ставит Rotate/SwapShape/Hint = 99, остальное не трогает."""
     data = copy.deepcopy(data)
     owned = data.get('ownedItems')
     if not isinstance(owned, dict):
@@ -80,23 +102,6 @@ def force_boosters(data: dict) -> dict:
     return data
 
 
-def _b64url_decode(segment: str) -> bytes:
-    padding = '=' * (-len(segment) % 4)
-    return base64.urlsafe_b64decode(segment + padding)
-
-
-def decode_jwt_payload(token: str) -> dict | None:
-    """Достаёт payload JWT без проверки подписи.
-    В проде подпись надо проверять по публичному ключу auth-service."""
-    try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return None
-        return json.loads(_b64url_decode(parts[1]))
-    except (ValueError, json.JSONDecodeError):
-        return None
-
-
 def get_bearer_token() -> str | None:
     auth = request.headers.get('Authorization', '')
     if not auth:
@@ -108,45 +113,23 @@ def get_bearer_token() -> str | None:
 
 
 def resolve_device_id_from_token():
-    """Возвращает (device_id, error_response).
-    Берёт deviceId из payload JWT в Authorization: Bearer ..."""
     token = get_bearer_token()
     if not token:
         return None, (jsonify({"error": "Authorization: Bearer <token> required"}), 401)
 
-    payload = decode_jwt_payload(token)
-    if not payload:
-        return None, (jsonify({"error": "invalid JWT"}), 401)
+    sessions = load_sessions()
+    session = sessions.get(token)
+    if not session:
+        return None, (jsonify({"error": "invalid or expired session token"}), 401)
 
-    device_id = payload.get('deviceId')
-    if not device_id:
-        return None, (jsonify({"error": "deviceId not found in token"}), 401)
+    expires_at_ms = session.get('expiresAt', 0)
+    now_ms = int(now_utc().timestamp() * 1000)
+    if expires_at_ms and now_ms > expires_at_ms:
+        sessions.pop(token, None)
+        save_sessions(sessions)
+        return None, (jsonify({"error": "session token expired"}), 401)
 
-    return device_id, None
-
-
-def read_request_body():
-    """Читает тело запроса, при необходимости распаковывает gzip/deflate,
-    и парсит как JSON. Возвращает (obj, error_response)."""
-    raw = request.get_data(cache=False) or b''
-    if not raw:
-        return {}, None
-
-    encoding = (request.headers.get('Content-Encoding') or '').lower().strip()
-    try:
-        if 'gzip' in encoding:
-            raw = gzip.decompress(raw)
-        # deflate/zlib иногда тоже шлют — но по заголовку выше gzip,
-        # для простоты deflate можно добавить при необходимости
-    except OSError:
-        return None, (jsonify({"error": "failed to decompress request body"}), 400)
-
-    try:
-        obj = json.loads(raw.decode('utf-8'))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, (jsonify({"error": "invalid JSON body"}), 400)
-
-    return obj, None
+    return session['deviceId'], None
 
 
 # ---------- endpoints ----------
@@ -157,32 +140,20 @@ def get_time():
 
 @app.route('/api/v1/popup/configuration', methods=['GET'])
 def get_popup_configuration():
-    return jsonify({
-        "isEnabled": False,
-        "version": "1.0.1",
-        "offerTriggers": {}
-    })
+    return jsonify({"isEnabled": False, "version": "1.0.1", "offerTriggers": {}})
 
 
 @app.route('/api/v1/offers', methods=['GET'])
 def get_offers():
-    return jsonify({
-        "offers": [],
-        "isEnabled": False,
-        "version": "1.0.4",
-        "unlockLevel": 0
-    })
+    return jsonify({"offers": [], "isEnabled": False, "version": "1.0.4", "unlockLevel": 0})
 
 
 @app.route('/api/v1/login/auth', methods=['POST'])
 def login_auth():
-    body, err = read_request_body()
-    if err:
-        return err
-
-    device_id = body.get('deviceId')
-    game_id = body.get('gameId', 'T4')
-    device_info = body.get('deviceInfo') or {}
+    data = request.get_json(silent=True) or {}
+    device_id = data.get('deviceId')
+    game_id = data.get('gameId', 'T4')
+    device_info = data.get('deviceInfo') or {}
 
     if not device_id:
         return jsonify({"error": "deviceId is required"}), 400
@@ -192,37 +163,72 @@ def login_auth():
 
     if is_new_user:
         users[device_id] = {
-            "userId": __import__('uuid').uuid4().hex[:24],
+            "userId": generate_user_id(),
             "deviceId": device_id,
             "gameId": game_id,
+            "supportCode": generate_support_code(),
             "installTime": int(now_utc().timestamp() * 1000),
             "balance": 100,
             "createdAt": iso_now_ms(),
         }
 
     user = users[device_id]
-    if device_info.get('installTime') is not None:
-        user['installTime'] = device_info['installTime']
+    client_install_time = device_info.get('installTime')
+    if client_install_time is not None:
+        user['installTime'] = client_install_time
     save_users(users)
 
-    # --- здесь могла бы быть выдача реального JWT от auth-service ---
-    # для совместимости оставляем простой hex-токен
-    import uuid as _uuid
-    session_token = _uuid.uuid4().hex
+    user_id = user['userId']
+    support_code = user['supportCode']
+    install_time = user['installTime']
+
     issued_at = int(now_utc().timestamp())
     expires_at = issued_at + 86400
+    session_token = uuid.uuid4().hex
+
+    sessions = load_sessions()
+    sessions[session_token] = {
+        "deviceId": device_id,
+        "userId": user_id,
+        "issuedAt": issued_at * 1000,
+        "expiresAt": expires_at * 1000,
+    }
+    save_sessions(sessions)
+
+    play_link_payload = {
+        "iat": issued_at, "nbf": issued_at, "exp": expires_at,
+        "partnerApplicationId": f"{game_id}Tetris_Prod_34c9cba7-f7c6-4166-b96e-d810e63a36cf",
+        "playerId": user_id, "playstudiosUserId": user_id,
+        "supportCode": support_code, "identityProvider": "Anonymous",
+    }
+    play_link_token = make_jwt(play_link_payload, JWT_SECRET)
 
     return jsonify({
         "sessionToken": session_token,
         "sessionExpiration": expires_at * 1000,
-        "userId": user['userId'],
-        "installTime": user['installTime'],
+        "userId": user_id,
+        "installTime": install_time,
+        "playLinkToken": play_link_token,
         "lp": {"currentBalance": user['balance']},
+        "supportCode": support_code,
         "isNewUser": is_new_user,
         "isDailyLimitReached": False,
         "time": {"currentTime": iso_now_ms()},
         "socialInfo": {"isSocialAcc": False, "connectedTo": None, "email": None},
         "myVipStatus": {"tier": 0},
+        "avaManifest": {
+            "cs": {
+                "base-game-configuration": {"p": "dd16f1e5/0/", "s": [], "a": [], "c": True},
+                "gameplay-ftue": {"p": "16c2751c/0/", "s": [], "a": [], "c": True},
+                "base-game-configuration-with-version": {"p": "f1fae5fd/0/", "s": [], "a": [], "c": True},
+                "classic-smart-config": {"p": "ee952b4e/0/", "s": [], "a": [], "c": True},
+                "level-chest": {"p": "4b058c61/0/", "s": [], "a": [], "c": True},
+            },
+            "ms": ["control", "Non_Paying_Users", "Android_Valentine"],
+            "h": "e2352e9379dedbe9",
+            "t": now_utc().strftime('%m/%d/%Y %H:%M:%S'),
+        },
+        "loyaltyServiceToken": None,
     })
 
 
@@ -232,24 +238,20 @@ def post_game_data():
     if err:
         return err
 
-    body, err = read_request_body()
-    if err:
-        return err
+    # Принимаем ровно то, что прислал клиент — целиком, без обёрток и вырезаний.
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "invalid JSON body"}), 400
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON body must be an object"}), 400
 
-    if not isinstance(body, dict):
-        return jsonify({"error": "body must be a JSON object"}), 400
-
-    # применяем бустеры = 99
-    game_state = force_boosters(body)
+    # Единственная модификация — гарантированные бустеры по 99.
+    payload = force_boosters(payload)
 
     all_data = load_game_data()
-    all_data[device_id] = {
-        "data": game_state,
-        "updatedAt": iso_now_ms(),
-    }
+    all_data[device_id] = payload            # храним сам объект, без обёртки
     save_game_data(all_data)
 
-    # клиент ожидает подтверждения приёма
     return jsonify({"ok": True})
 
 
@@ -260,12 +262,15 @@ def get_game_data():
         return err
 
     all_data = load_game_data()
-    entry = all_data.get(device_id)
-    if not entry:
+    payload = all_data.get(device_id)
+
+    if payload is None:
+        # Первый заход без сохранения — отдаём пустой объект, клиент сам подгрузит дефолты.
         return jsonify({})
 
-    data = force_boosters(entry['data'])
-    return jsonify(data)
+    # На всякий случай снова гарантируем 99 (если файл кто-то правил руками).
+    payload = force_boosters(payload)
+    return jsonify(payload)
 
 
 if __name__ == '__main__':
