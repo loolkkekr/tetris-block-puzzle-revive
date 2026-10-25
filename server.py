@@ -6,10 +6,15 @@ import uuid
 import hashlib
 import hmac
 import base64
+import copy
 
 app = Flask(__name__)
 
 USERS_FILE = 'users.json'
+GAME_DATA_FILE = 'game_data.json'
+
+BOOSTER_IDS = ('Rotate', 'SwapShape', 'Hint')
+BOOSTER_AMOUNT = 99
 
 
 # ---------- helpers ----------
@@ -21,28 +26,45 @@ def iso_now_ms():
     return now_utc().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
 
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        return {}
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
     try:
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
-        return {}
+        return default
+
+
+def save_json(path, data):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_users():
+    return load_json(USERS_FILE, {})
 
 
 def save_users(users):
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    save_json(USERS_FILE, users)
 
+
+def load_game_data():
+    return load_json(GAME_DATA_FILE, {})
+
+
+def save_game_data(data):
+    save_json(GAME_DATA_FILE, data)
+
+
+def generate_support_code():
+    return ''.join(uuid.uuid4().hex.upper()[:6])
 
 
 def generate_user_id():
-    # 24-символьный hex, как ObjectId
     return uuid.uuid4().hex[:24]
 
 
-# ---------- JWT (HS256) ----------
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
 
@@ -57,6 +79,42 @@ def make_jwt(payload: dict, secret: str) -> str:
 
 
 JWT_SECRET = 'change-me-in-production'
+
+
+def force_boosters(data: dict) -> dict:
+    """Принудительно ставит Rotate/SwapShape/Hint = 99 в ownedItems.currencies."""
+    data = copy.deepcopy(data)
+    owned = data.get('ownedItems')
+    if not isinstance(owned, dict):
+        owned = {}
+        data['ownedItems'] = owned
+    currencies = owned.get('currencies')
+    if not isinstance(currencies, dict):
+        currencies = {}
+        owned['currencies'] = currencies
+
+    for booster_id in BOOSTER_IDS:
+        entry = currencies.get(booster_id)
+        if not isinstance(entry, dict):
+            entry = {}
+            currencies[booster_id] = entry
+        entry['CurrencyId'] = booster_id
+        entry.setdefault('Tag', None)
+        entry['CurrencyAmounts'] = [{"Amount": BOOSTER_AMOUNT}]
+        entry.setdefault('CurrencyExpiringAmounts', [])
+        entry.setdefault('CurrencyAmountExpiringInfinite', None)
+
+    return data
+
+
+def _resolve_device_id(payload: dict) -> str | None:
+    """Пытаемся вытащить deviceId из тела или query, либо из заголовка."""
+    if not isinstance(payload, dict):
+        payload = {}
+    device_id = payload.get('deviceId') or request.args.get('deviceId')
+    if not device_id:
+        device_id = request.headers.get('X-Device-Id')
+    return device_id
 
 
 # ---------- endpoints ----------
@@ -87,7 +145,6 @@ def get_offers():
 @app.route('/api/v1/login/auth', methods=['POST'])
 def login_auth():
     data = request.get_json(silent=True) or {}
-
     device_id = data.get('deviceId')
     game_id = data.get('gameId', 'T4')
     device_info = data.get('deviceInfo') or {}
@@ -95,7 +152,6 @@ def login_auth():
     if not device_id:
         return jsonify({"error": "deviceId is required"}), 400
 
-    # ---- загрузка / создание пользователя ----
     users = load_users()
     is_new_user = device_id not in users
 
@@ -104,7 +160,7 @@ def login_auth():
             "userId": generate_user_id(),
             "deviceId": device_id,
             "gameId": game_id,
-            "supportCode": "Discord: loolkkekr",
+            "supportCode": generate_support_code(),
             "installTime": int(now_utc().timestamp() * 1000),
             "balance": 100,
             "createdAt": iso_now_ms(),
@@ -112,7 +168,6 @@ def login_auth():
 
     user = users[device_id]
 
-    # если клиент прислал installTime — обновим у себя (если он не был задан)
     client_install_time = device_info.get('installTime')
     if client_install_time is not None:
         user['installTime'] = client_install_time
@@ -122,10 +177,8 @@ def login_auth():
     support_code = user['supportCode']
     install_time = user['installTime']
 
-    # ---- токены ----
     issued_at = int(now_utc().timestamp())
-    expires_at = issued_at + 86400  # 24 часа
-
+    expires_at = issued_at + 86400
     session_token = uuid.uuid4().hex
 
     play_link_payload = {
@@ -142,7 +195,7 @@ def login_auth():
 
     response = {
         "sessionToken": session_token,
-        "sessionExpiration": expires_at * 1000,  # мс
+        "sessionExpiration": expires_at * 1000,
         "userId": user_id,
         "installTime": install_time,
         "playLinkToken": play_link_token,
@@ -151,11 +204,7 @@ def login_auth():
         "isNewUser": is_new_user,
         "isDailyLimitReached": False,
         "time": {"currentTime": iso_now_ms()},
-        "socialInfo": {
-            "isSocialAcc": False,
-            "connectedTo": None,
-            "email": None
-        },
+        "socialInfo": {"isSocialAcc": False, "connectedTo": None, "email": None},
         "myVipStatus": {"tier": 0},
         "avaManifest": {
             "cs": {
@@ -173,6 +222,47 @@ def login_auth():
     }
 
     return jsonify(response)
+
+
+@app.route('/api/v1/game/data', methods=['POST'])
+def post_game_data():
+    payload = request.get_json(silent=True) or {}
+    device_id = _resolve_device_id(payload)
+
+    if not device_id:
+        return jsonify({"error": "deviceId is required (in body, query, or X-Device-Id header)"}), 400
+
+    # Убираем служебный deviceId из сохраняемых данных, если он там был
+    game_state = {k: v for k, v in payload.items() if k != 'deviceId'}
+
+    # Принудительно ставим бустеры в 99
+    game_state = force_boosters(game_state)
+
+    # Загружаем всё хранилище и обновляем запись игрока
+    all_data = load_game_data()
+    all_data[device_id] = {
+        "data": game_state,
+        "updatedAt": iso_now_ms(),
+    }
+    save_game_data(all_data)
+
+    return jsonify({"ok": True})
+
+
+@app.route('/api/v1/game/data', methods=['GET'])
+def get_game_data():
+    device_id = _resolve_device_id({})
+    if not device_id:
+        return jsonify({"error": "deviceId is required (query param ?deviceId=... or X-Device-Id header)"}), 400
+
+    all_data = load_game_data()
+    entry = all_data.get(device_id)
+    if not entry:
+        return jsonify({"error": "no saved game data for deviceId", "deviceId": device_id}), 404
+
+    # Всегда гарантируем, что бустеры = 99, даже если в файле лежит старое значение
+    data = force_boosters(entry['data'])
+    return jsonify(data)
 
 
 if __name__ == '__main__':
