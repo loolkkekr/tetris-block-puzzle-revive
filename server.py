@@ -12,6 +12,7 @@ app = Flask(__name__)
 
 USERS_FILE = 'users.json'
 GAME_DATA_FILE = 'game_data.json'
+SESSIONS_FILE = 'sessions.json'   # token -> deviceId
 
 BOOSTER_IDS = ('Rotate', 'SwapShape', 'Hint')
 BOOSTER_AMOUNT = 99
@@ -57,6 +58,14 @@ def save_game_data(data):
     save_json(GAME_DATA_FILE, data)
 
 
+def load_sessions():
+    return load_json(SESSIONS_FILE, {})
+
+
+def save_sessions(sessions):
+    save_json(SESSIONS_FILE, sessions)
+
+
 def generate_support_code():
     return ''.join(uuid.uuid4().hex.upper()[:6])
 
@@ -82,7 +91,6 @@ JWT_SECRET = 'change-me-in-production'
 
 
 def force_boosters(data: dict) -> dict:
-    """Принудительно ставит Rotate/SwapShape/Hint = 99 в ownedItems.currencies."""
     data = copy.deepcopy(data)
     owned = data.get('ownedItems')
     if not isinstance(owned, dict):
@@ -107,14 +115,37 @@ def force_boosters(data: dict) -> dict:
     return data
 
 
-def _resolve_device_id(payload: dict) -> str | None:
-    """Пытаемся вытащить deviceId из тела или query, либо из заголовка."""
-    if not isinstance(payload, dict):
-        payload = {}
-    device_id = payload.get('deviceId') or request.args.get('deviceId')
-    if not device_id:
-        device_id = request.headers.get('X-Device-Id')
-    return device_id
+def get_bearer_token() -> str | None:
+    auth = request.headers.get('Authorization', '')
+    if not auth:
+        return None
+    parts = auth.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == 'bearer':
+        return parts[1].strip()
+    return None
+
+
+def resolve_device_id_from_token():
+    """Возвращает (device_id, error_response)."""
+    token = get_bearer_token()
+    if not token:
+        return None, (jsonify({"error": "Authorization: Bearer <token> required"}), 401)
+
+    sessions = load_sessions()
+    session = sessions.get(token)
+    if not session:
+        return None, (jsonify({"error": "invalid or expired session token"}), 401)
+
+    # опционально: проверка срока жизни
+    expires_at_ms = session.get('expiresAt', 0)
+    now_ms = int(now_utc().timestamp() * 1000)
+    if expires_at_ms and now_ms > expires_at_ms:
+        # чистим просроченную сессию
+        sessions.pop(token, None)
+        save_sessions(sessions)
+        return None, (jsonify({"error": "session token expired"}), 401)
+
+    return session['deviceId'], None
 
 
 # ---------- endpoints ----------
@@ -181,6 +212,16 @@ def login_auth():
     expires_at = issued_at + 86400
     session_token = uuid.uuid4().hex
 
+    # ---- сохраняем сессию: token -> deviceId ----
+    sessions = load_sessions()
+    sessions[session_token] = {
+        "deviceId": device_id,
+        "userId": user_id,
+        "issuedAt": issued_at * 1000,
+        "expiresAt": expires_at * 1000,
+    }
+    save_sessions(sessions)
+
     play_link_payload = {
         "iat": issued_at,
         "nbf": issued_at,
@@ -226,19 +267,16 @@ def login_auth():
 
 @app.route('/api/v1/game/data', methods=['POST'])
 def post_game_data():
+    device_id, err = resolve_device_id_from_token()
+    if err:
+        return err
+
     payload = request.get_json(silent=True) or {}
-    device_id = _resolve_device_id(payload)
+    # на всякий случай вырезаем служебные поля, если клиент их прислал
+    game_state = {k: v for k, v in payload.items() if k not in ('deviceId',)}
 
-    if not device_id:
-        return jsonify({"error": "deviceId is required (in body, query, or X-Device-Id header)"}), 400
-
-    # Убираем служебный deviceId из сохраняемых данных, если он там был
-    game_state = {k: v for k, v in payload.items() if k != 'deviceId'}
-
-    # Принудительно ставим бустеры в 99
     game_state = force_boosters(game_state)
 
-    # Загружаем всё хранилище и обновляем запись игрока
     all_data = load_game_data()
     all_data[device_id] = {
         "data": game_state,
@@ -251,16 +289,16 @@ def post_game_data():
 
 @app.route('/api/v1/game/data', methods=['GET'])
 def get_game_data():
-    device_id = _resolve_device_id({})
-    if not device_id:
-        return jsonify({"error": "deviceId is required (query param ?deviceId=... or X-Device-Id header)"}), 400
+    device_id, err = resolve_device_id_from_token()
+    if err:
+        return err
 
     all_data = load_game_data()
     entry = all_data.get(device_id)
     if not entry:
-        return jsonify({"error": "no saved game data for deviceId", "deviceId": device_id}), 404
+        # ещё не было POST — вернём пустой объект, чтобы клиент не упал
+        return jsonify({})
 
-    # Всегда гарантируем, что бустеры = 99, даже если в файле лежит старое значение
     data = force_boosters(entry['data'])
     return jsonify(data)
 
