@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 USERS_FILE = 'users.json'
 GAME_DATA_FILE = 'game_data.json'
-SESSIONS_FILE = 'sessions.json'   # token -> deviceId
+SESSIONS_FILE = 'sessions.json'
 
 BOOSTER_IDS = ('Rotate', 'SwapShape', 'Hint')
 BOOSTER_AMOUNT = 99
@@ -91,6 +91,7 @@ JWT_SECRET = 'change-me-in-production'
 
 
 def force_boosters(data: dict) -> dict:
+    """Возвращает копию data, где Rotate/SwapShape/Hint = 99."""
     data = copy.deepcopy(data)
     owned = data.get('ownedItems')
     if not isinstance(owned, dict):
@@ -126,7 +127,6 @@ def get_bearer_token() -> str | None:
 
 
 def resolve_device_id_from_token():
-    """Возвращает (device_id, error_response)."""
     token = get_bearer_token()
     if not token:
         return None, (jsonify({"error": "Authorization: Bearer <token> required"}), 401)
@@ -136,11 +136,9 @@ def resolve_device_id_from_token():
     if not session:
         return None, (jsonify({"error": "invalid or expired session token"}), 401)
 
-    # опционально: проверка срока жизни
     expires_at_ms = session.get('expiresAt', 0)
     now_ms = int(now_utc().timestamp() * 1000)
     if expires_at_ms and now_ms > expires_at_ms:
-        # чистим просроченную сессию
         sessions.pop(token, None)
         save_sessions(sessions)
         return None, (jsonify({"error": "session token expired"}), 401)
@@ -212,7 +210,6 @@ def login_auth():
     expires_at = issued_at + 86400
     session_token = uuid.uuid4().hex
 
-    # ---- сохраняем сессию: token -> deviceId ----
     sessions = load_sessions()
     sessions[session_token] = {
         "deviceId": device_id,
@@ -271,15 +268,14 @@ def post_game_data():
     if err:
         return err
 
-    payload = request.get_json(silent=True) or {}
-    # на всякий случай вырезаем служебные поля, если клиент их прислал
-    game_state = {k: v for k, v in payload.items() if k not in ('deviceId',)}
-
-    game_state = force_boosters(game_state)
+    # Сохраняем ВЕСЬ JSON, как пришёл от клиента — без модификаций.
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "invalid or empty JSON body"}), 400
 
     all_data = load_game_data()
     all_data[device_id] = {
-        "data": game_state,
+        "data": payload,
         "updatedAt": iso_now_ms(),
     }
     save_game_data(all_data)
@@ -296,9 +292,10 @@ def get_game_data():
     all_data = load_game_data()
     entry = all_data.get(device_id)
     if not entry:
-        # ещё не было POST — вернём пустой объект, чтобы клиент не упал
+        # Прогресса ещё нет — отдаём пустой объект, чтобы клиент не падал.
         return jsonify({})
 
+    # Отдаём сохранённый JSON как есть, только бустеры принудительно = 99.
     data = force_boosters(entry['data'])
     return jsonify(data)
 
